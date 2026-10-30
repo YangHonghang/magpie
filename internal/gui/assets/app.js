@@ -6320,6 +6320,16 @@ function renderProviders() {
     if (p.off) name.append(el("span", "badge off", t("Switched off")));
     if (p.move && p.move.state !== "plugin") name.append(deprecatedBadge());
     const n = p.models.filter((m) => m.on).length;
+    // what it bills at now (#2463): the price rate and the hour's window
+    // as one, by the row so a shared key's spend is no surprise; the
+    // server's clock, which calls are counted on, says which window
+    const now = p.rateNow || 0;
+    if (now > 0) {
+      const rate = "×" + (now < 0.01 ? "<0.01" : String(+now.toFixed(2)));
+      const b = el("span", "badge rate-now", rate);
+      b.title = t("Bills at {rate} now: the price rate times the window of the hour, set under the editor's Advanced", { rate });
+      name.append(b);
+    }
     // a provider that only draws images (Settings → Image generation) says so
     const models = n ? t(n === 1 ? "{n} model" : "{n} models", { n })
       : p.draws ? t(p.draws === 1 ? "{n} image model" : "{n} image models", { n: p.draws }) : t(p.noModels ? "usage only" : "no models exposed");
@@ -7907,6 +7917,108 @@ function priceRateField() {
   box.oninput = () => { draft.priceRate = box.value; };
   return field(t("Price rate"), box, t("Costs are counted at the official price times this, as a relay bills, like 0.8 or 1.5; a price you set for a model stays as set"));
 }
+// rateWindowsDraft is a provider's windows as the editor keeps them (#2463).
+function rateWindowsDraft(p) {
+  return (p?.rateWindows || []).map((w) => ({ days: [...(w.days || [])], start: w.start || "", end: w.end || "", rate: w.rate ? String(w.rate) : "" }));
+}
+// rateWindowsField: the time-of-day windows the provider bills at its own
+// rate (#2463), a peak at 2× or a discount off peak. Each window is its
+// days (none ticked: every day), a span that may cross midnight, and a
+// rate the official price is times inside it, on top of the price rate;
+// the first window that holds a call wins, outside them the price rate
+// alone counts.
+function rateWindowsField() {
+  const box = el("div", "stack rate-windows");
+  const paint = () => {
+    box.replaceChildren();
+    for (const w of draft.rateWindows || []) box.append(rateWindowRow(w, paint));
+    if ((draft.rateWindows || []).length < 8) {
+      const add = el("button", "text", t("Add a window"));
+      add.type = "button";
+      add.onclick = () => { (draft.rateWindows ??= []).push({ days: [], start: "", end: "", rate: "" }); paint(); };
+      box.append(add);
+    }
+  };
+  paint();
+  return field(t("Rate windows"), box, t("Inside a window a call costs the official price times its rate, on top of the price rate; outside every window the price rate alone counts. The first window that holds a call wins. Times are on the clock of the computer magpie runs on, and 22:00–6:00 crosses midnight. No day ticked is every day. A price you set for a model is scaled by the window too. Changing the windows prices the calls already counted again, as a changed price rate does."));
+}
+// rateWindowRow is one window of the editor, its draft w kept as typed.
+function rateWindowRow(w, repaint) {
+  const row = el("div", "rate-win"), chips = el("div", "day-chips");
+  const names = [t("Sun"), t("Mon"), t("Tue"), t("Wed"), t("Thu"), t("Fri"), t("Sat")];
+  for (let d = 0; d < 7; d++) {
+    const b = el("button", "day-chip" + (w.days.includes(d) ? " on" : ""), names[d]);
+    b.type = "button";
+    b.setAttribute("aria-pressed", String(w.days.includes(d)));
+    b.onclick = () => { const at = w.days.indexOf(d); if (at < 0) w.days.push(d); else w.days.splice(at, 1); w.days.sort((a, z) => a - z); b.classList.toggle("on"); b.setAttribute("aria-pressed", String(w.days.includes(d))); };
+    chips.append(b);
+  }
+  const rate = input(w.rate, "3");
+  rate.classList.add("rate-rate");
+  rate.inputMode = "decimal";
+  rate.setAttribute("aria-label", t("Rate in this window"));
+  rate.oninput = () => { w.rate = rate.value; };
+  const del = el("button", "text rate-win-del", "×");
+  del.type = "button";
+  del.title = t("Remove this window");
+  del.onclick = () => {
+    const at = (draft.rateWindows || []).indexOf(w);
+    if (at >= 0) draft.rateWindows.splice(at, 1);
+    repaint();
+  };
+  row.append(chips, timePick(w, "start", "Window starts at"), el("span", "rate-dash", "–"),
+    timePick(w, "end", "Window ends at"), rate, del);
+  return row;
+}
+// timePick is a window's start or end as the app's own menu of half
+// hours, not typed; an end may be 24:00.
+function timePick(w, key, head) {
+  const b = el("button", "sess-pick rate-time");
+  b.type = "button";
+  b.setAttribute("aria-haspopup", "menu");
+  b.setAttribute("aria-expanded", "false");
+  b.setAttribute("aria-label", t(head));
+  const paint = () => {
+    b.dataset.value = w[key] || "";
+    b.replaceChildren(el("span", "", w[key] || "--:--"), svg(CHEV, 11, 1.6));
+  };
+  b.onclick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (b.classList.contains("open")) return closeProtoMenu();
+    const times = [];
+    for (let m = 0; m < 1440; m += 30) times.push(String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0"));
+    if (key === "end") times.push("24:00");
+    openProtoMenu(b, times.map((v) => ({ v, name: v, note: "", literalName: true })), w[key], (v) => { w[key] = v; paint(); }, head, "sess-menu");
+  };
+  paint();
+  return b;
+}
+// rateWindowsOfDraft is the draft's windows as saved — null for none —
+// or undefined when one is typed wrong.
+function rateWindowsOfDraft() {
+  const out = [];
+  for (const w of draft.rateWindows || []) {
+    const start = clockOf(w.start), end = clockOf(w.end);
+    if (start === null || end === null || start === end) return undefined;
+    const n = decimalOf(String(w.rate ?? "").trim());
+    if (!(n > 0 && n <= 1000) || Math.abs(n * 1000 - Math.round(n * 1000)) > 1e-6) return undefined;
+    out.push({ days: [...w.days], start: String(w.start).trim(), end: String(w.end).trim(), rate: n });
+  }
+  return out.length ? out : null;
+}
+// clockOf reads "H:MM" or "HH:MM" as typed, 24:00 included; null for
+// what isn't one.
+function clockOf(v) {
+  const m = String(v ?? "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const min = +m[1] * 60 + +m[2];
+  return +m[1] > 24 || +m[2] > 59 || min > 1440 ? null : min;
+}
+function rateWindowsError(ed) {
+  shown(ed.querySelector(".rate-windows input"))?.focus({ preventScroll: true });
+  return editorError(t("Rate windows: every window is days, a time like 09:00, another time for it to end, and a rate from 0 to 1000 with at most three decimals"), "warn");
+}
 // pluginOptionsField: the switches a plugin declares for its provider
 // (auth.options, #2038, Vocllum), each an Off/On beside the plugin's own
 // words for it, put in as text. One the plugin asks to confirm is asked
@@ -8038,6 +8150,7 @@ function advancedSet(d, p) {
   return (d.headers || []).some(([k]) => (k || "").trim()) || !!(d.extraBody || "").trim() || !!(d.replyHeaders || "").trim() ||
     !!d.proxyMode || Object.values(d.accountProxies || {}).some((x) => x?.mode) ||
     [d.concurrency, d.queueLimit, d.queueWait, d.maxRPM, d.priceRate, d.contexts, d.outputs, d.compacts].some((v) => String(v ?? "").trim()) ||
+    !!(d.rateWindows || []).length ||
     !!(d.searches || d.authHeader || d.passUserAgent || d.unredacted || d.pinUpstream || d.nativeCompaction || d.balanceToken || d.limitRestOff) ||
     !!d.fallback?.length || !!p?.balanceToken?.set;
 }
@@ -9206,7 +9319,7 @@ function baseAPIOf(p) {
 
 // draftOf is a saved provider as its editor's form holds it.
 function draftOf(p) {
-  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, best: !!p.bestInFamily, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), replyHeaders: (p.replyHeaders || []).join(", "), icon: p.icon || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, hiddenDrawers: [...(p.hiddenDrawers || [])], searches: !!p.searches, unredacted: !!p.unredacted, insecureTLS: !!p.insecureTLS, limitRestOff: !!p.limitRestOff, nativeCompaction: !!p.nativeCompaction, passUserAgent: !!p.passUserAgent, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p) };
+  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, gemini: p.gemini || "", catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), none: !!p.noModels, best: !!p.bestInFamily, extra: [], headers: headerRows(p.headers), extraBody: extraBodyText(p.extraBody), replyHeaders: (p.replyHeaders || []).join(", "), icon: p.icon || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, hiddenDrawers: [...(p.hiddenDrawers || [])], searches: !!p.searches, unredacted: !!p.unredacted, insecureTLS: !!p.insecureTLS, limitRestOff: !!p.limitRestOff, nativeCompaction: !!p.nativeCompaction, passUserAgent: !!p.passUserAgent, pinUpstream: !!p.pinUpstream, authHeader: p.authHeader || "", balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", balanceMethod: p.balanceMethod || "", modelsURL: p.modelsURL || "", contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p), rateWindows: rateWindowsDraft(p) };
 }
 
 // duplicateProvider opens the Add form on a copy of p (#268): its URLs,
@@ -9513,6 +9626,7 @@ function drawEditor(p, presetID) {
     advIn.append(...field(t("Proxy"), proxies));
     advIn.append(...concurrencyField(p));
     advIn.append(...priceRateField());
+    advIn.append(...rateWindowsField());
     if (p.cline) advIn.append(...upstreamField());
     ed.append(...pluginOptionsField(subOf(a.agent)));
     // a plugin's provider is reached inside magpie: its plugin:// URLs go
@@ -9550,10 +9664,12 @@ function drawEditor(p, presetID) {
       if (queue.bad) return queueError(ed, queue.bad);
       const priceRate = priceRateOfDraft();
       if (priceRate === undefined) return priceRateError(ed);
+      const rateWindows = rateWindowsOfDraft();
+      if (rateWindows === undefined) return rateWindowsError(ed);
       if (priceTypedError(ed)) return;
       const picked = accountModelsDraft(p);
       if (picked === false) return pickError();
-      const body = { id: p.id, models: chosenIds(), noModels: noneChosen(), bestInFamily: bestChosen(), unlisted: draft.unlisted, hiddenDrawers: draft.hiddenDrawers, fallback: draft.fallback, contexts: cx.map, outputs: ox.map, compacts: cpx.map, proxy, accountProxies: own.map, maxConcurrency, ...queue, priceRate, modelPrefs: modelPrefsOfDraft(), pinUpstream: !!draft.pinUpstream, ...(p.carriesCompaction ? { nativeCompaction: !!draft.nativeCompaction } : {}), ...routingOfDraft(p) };
+      const body = { id: p.id, models: chosenIds(), noModels: noneChosen(), bestInFamily: bestChosen(), unlisted: draft.unlisted, hiddenDrawers: draft.hiddenDrawers, fallback: draft.fallback, contexts: cx.map, outputs: ox.map, compacts: cpx.map, proxy, accountProxies: own.map, maxConcurrency, ...queue, priceRate, rateWindows, modelPrefs: modelPrefsOfDraft(), pinUpstream: !!draft.pinUpstream, ...(p.carriesCompaction ? { nativeCompaction: !!draft.nativeCompaction } : {}), ...routingOfDraft(p) };
       saving(saveBtn, t("Saving…"));
       saveAccountModelsDraft(picked).then(() => savePluginOptions(subOf(a.agent))).then(() => providerAction("save", body, t("{name} saved", { name: p.name })), (e) => { doneSaving(saveBtn); editorError(e.message || String(e)); }); };
     bar.append(cancel, saveBtn);
@@ -9735,6 +9851,7 @@ function drawEditor(p, presetID) {
   advIn.append(...field(t("Proxy"), proxies));
   advIn.append(...concurrencyField(p));
   advIn.append(...priceRateField());
+  advIn.append(...rateWindowsField());
 
   if (p?.cline || (isNew && pr?.id === "clinepass")) advIn.append(...upstreamField());
 
@@ -10204,6 +10321,8 @@ function drawEditor(p, presetID) {
     Object.assign(body, queue);
     body.priceRate = priceRateOfDraft();
     if (body.priceRate === undefined) return priceRateError(ed);
+    body.rateWindows = rateWindowsOfDraft();
+    if (body.rateWindows === undefined) return rateWindowsError(ed);
     if (p && priceTypedError(ed)) return;
     if (draft.balanceToken) body.balanceToken = draft.balanceToken;
     else if (draft.clearBalanceToken) body.clearBalanceToken = true;
